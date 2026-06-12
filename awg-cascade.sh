@@ -147,6 +147,20 @@ check_subnet_conflict() {
     err "Задайте на VPS-2 другую внутреннюю подсеть AWG, создайте новый профиль и повторите запуск."
     exit 1
   fi
+
+  CASCADE_ADDRESS="$out_address"
+  CASCADE_IP="$out_ip"
+}
+
+wait_for_vps2_setup() {
+  echo
+  warn "Перед продолжением нужно один раз настроить обратный маршрут на VPS-2."
+  echo "Откройте второе SSH-подключение к VPS-2 и выполните команду целиком:"
+  echo
+  echo "sudo bash -c 'f=\$(mktemp); trap \"rm -f \\\"\$f\\\"\" EXIT; curl -fsSL https://raw.githubusercontent.com/ryderams/amneziawg-cascade/main/awg-cascade-vps2.sh -o \"\$f\" && bash \"\$f\" ${CASCADE_IP}'"
+  echo
+  echo "Скрипт автоматически получил адрес ${CASCADE_ADDRESS} из вставленного конфига."
+  read -rp "Когда команда на VPS-2 завершится успешно, вернитесь сюда и нажмите Enter... "
 }
 
 read_client_config() {
@@ -383,6 +397,8 @@ rollback_on_error() {
 
 main() {
   local raw_config prepared_config
+  CASCADE_ADDRESS=""
+  CASCADE_IP=""
   SETUP_IN_PROGRESS=0
   trap rollback_on_error EXIT
 
@@ -403,6 +419,7 @@ main() {
   read_client_config "$raw_config"
   check_subnet_conflict "$raw_config"
   prepare_out_config "$raw_config" "$prepared_config"
+  wait_for_vps2_setup
 
   backup_container_files
   make_rollback

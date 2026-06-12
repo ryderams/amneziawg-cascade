@@ -44,7 +44,29 @@ fi
 
 CASCADE_IP="${1:-}"
 if [[ -z "$CASCADE_IP" ]]; then
-  read -rp "Введите Address из профиля VPS-1-cascade без /32: " CASCADE_IP
+  addresses=()
+  while IFS= read -r address; do
+    [[ -n "$address" ]] && addresses+=("${address%/32}")
+  done < <(docker exec "$CONTAINER" awg show "$SERVER_IF" allowed-ips | \
+    awk '$2 ~ /^([0-9]{1,3}\.){3}[0-9]{1,3}\/32$/ {print $2}')
+
+  if ((${#addresses[@]} == 0)); then
+    err "На VPS-2 не найдено ни одного клиентского IPv4-адреса /32."
+    exit 1
+  fi
+
+  echo "Доступные клиентские адреса на VPS-2:"
+  for index in "${!addresses[@]}"; do
+    printf '  %d. %s/32\n' "$((index + 1))" "${addresses[index]}"
+  done
+  echo
+  read -rp "Введите номер адреса служебного профиля VPS-1-cascade: " choice
+  if [[ ! "$choice" =~ ^[0-9]+$ ]] || ((10#$choice < 1 || 10#$choice > ${#addresses[@]})); then
+    err "Некорректный номер: ${choice}"
+    exit 1
+  fi
+  selected_index=$((10#$choice - 1))
+  CASCADE_IP="${addresses[selected_index]}"
 fi
 CASCADE_IP="${CASCADE_IP%/32}"
 
