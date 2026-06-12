@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Настройка каскада AWG на VPS-1
-# Клиент -> AWG-сервер VPS-1 -> выходной AWG-туннель VPS-2 -> Интернет
-# Работает с уже установленным AmneziaWG и не устанавливает AWG-сервер.
+# Каскад для стандартной контейнерной установки AmneziaWG 2.0:
+# клиент -> awg0 на VPS-1 -> awg-out -> VPS-2 -> Интернет
 
+CONTAINER="amnezia-awg2"
+SERVER_IF="awg0"
 OUT_IF="awg-out"
 TABLE_ID="200"
-TABLE_NAME="awg_cascade"
-RT_TABLES="/etc/iproute2/rt_tables"
-OUT_CONF="/etc/amnezia/amneziawg/${OUT_IF}.conf"
+CONTAINER_DIR="/opt/amnezia/awg"
+OUT_CONF="${CONTAINER_DIR}/${OUT_IF}.conf"
+START_SCRIPT="/opt/amnezia/start.sh"
 BACKUP_DIR="/root/awg-cascade-backup-$(date +%Y%m%d-%H%M%S)"
 ROLLBACK_FILE="/root/awg-cascade-rollback.sh"
-SYSCTL_FILE="/etc/sysctl.d/99-awg-cascade.conf"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -25,269 +25,79 @@ err() { echo -e "${RED}[-]${NC} $*"; }
 
 need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    err "Запустите скрипт от root: sudo bash $0"
+    err "Запустите скрипт от root или через sudo."
     exit 1
   fi
 }
 
 cmd_exists() { command -v "$1" >/dev/null 2>&1; }
 
-require_cmds() {
-  local missing=()
-  for c in ip awk sed grep tr systemctl sysctl iptables install mktemp cp chmod mkdir touch dirname ping sleep; do
-    cmd_exists "$c" || missing+=("$c")
+require_host_cmds() {
+  local missing=() command
+  for command in docker awk sed grep tr head install mktemp cp chmod mkdir touch rm date; do
+    cmd_exists "$command" || missing+=("$command")
   done
   if ((${#missing[@]})); then
-    err "Не найдены необходимые команды: ${missing[*]}"
-    exit 1
-  fi
-  if ! cmd_exists awg-quick; then
-    err "Команда awg-quick не найдена. Сначала установите и настройте AmneziaWG."
-    exit 1
-  fi
-  if ! cmd_exists awg; then
-    err "Команда awg не найдена. Установка AmneziaWG на VPS-1 неполная."
+    err "На VPS-1 не найдены необходимые команды: ${missing[*]}"
     exit 1
   fi
 }
 
-check_awg_on_vps1() {
-  local interfaces configs=() conf
+container_exec() {
+  docker exec "$CONTAINER" "$@"
+}
 
-  if ! systemctl cat 'awg-quick@.service' >/dev/null 2>&1; then
-    err "Не найден systemd-сервис awg-quick@.service."
-    err "Установите AmneziaWG 2.0 на VPS-1 и запустите его сервер."
+check_awg_container() {
+  local command
+
+  if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+    if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+      err "Контейнер ${CONTAINER} найден, но не запущен."
+    else
+      err "Контейнер ${CONTAINER} не найден на VPS-1."
+    fi
+    err "Установите и запустите AmneziaWG 2.0 через приложение AmneziaVPN."
     exit 1
   fi
 
-  for conf in /etc/amnezia/amneziawg/*.conf /etc/wireguard/*.conf; do
-    [[ -f "$conf" ]] || continue
-    [[ "${conf##*/}" == "${OUT_IF}.conf" ]] && continue
-    configs+=("$conf")
+  for command in awg awg-quick ip iptables awk sed grep curl; do
+    if ! container_exec sh -c "command -v ${command} >/dev/null 2>&1"; then
+      if [[ "$command" == "curl" ]]; then
+        warn "В контейнере нет curl: проверка внешнего IP будет пропущена."
+      else
+        err "В контейнере ${CONTAINER} не найдена команда ${command}."
+        exit 1
+      fi
+    fi
   done
 
-  if ((${#configs[@]} == 0)); then
-    err "На VPS-1 не найден серверный конфиг AmneziaWG."
-    err "Сначала установите и настройте сервер AWG 2.0 на VPS-1."
+  if ! container_exec test -f "${CONTAINER_DIR}/${SERVER_IF}.conf"; then
+    err "В контейнере не найден серверный конфиг ${CONTAINER_DIR}/${SERVER_IF}.conf."
     exit 1
   fi
 
-  interfaces="$(awg show interfaces 2>/dev/null || true)"
-  interfaces="$(printf '%s\n' "$interfaces" | tr ' ' '\n' | grep -v "^${OUT_IF}$" | sed '/^$/d' || true)"
-  if [[ -z "$interfaces" ]]; then
-    err "AmneziaWG установлен, но серверный AWG-интерфейс на VPS-1 не запущен."
-    err "Проверьте состояние сервера AWG и повторите запуск скрипта."
+  if ! container_exec awg show interfaces | tr ' ' '\n' | grep -qx "$SERVER_IF"; then
+    err "Серверный интерфейс ${SERVER_IF} в контейнере ${CONTAINER} не запущен."
     exit 1
   fi
 
-  log "AmneziaWG на VPS-1 установлен и запущен."
+  log "Контейнер AmneziaWG 2.0 найден, интерфейс ${SERVER_IF} запущен."
 }
 
-choose_conf_dir() {
-  if [[ -d /etc/amnezia/amneziawg ]]; then
-    OUT_CONF="/etc/amnezia/amneziawg/${OUT_IF}.conf"
-  elif [[ -d /etc/wireguard ]]; then
-    OUT_CONF="/etc/wireguard/${OUT_IF}.conf"
-  else
-    mkdir -p /etc/amnezia/amneziawg
-    OUT_CONF="/etc/amnezia/amneziawg/${OUT_IF}.conf"
-  fi
-}
-
-backup() {
-  mkdir -p "$BACKUP_DIR"
-  [[ -f "$RT_TABLES" ]] && cp -a "$RT_TABLES" "$BACKUP_DIR/rt_tables"
-  [[ -f "$OUT_CONF" ]] && cp -a "$OUT_CONF" "$BACKUP_DIR/${OUT_IF}.conf"
-  [[ -f "$SYSCTL_FILE" ]] && cp -a "$SYSCTL_FILE" "$BACKUP_DIR/99-awg-cascade.conf"
-  log "Резервная копия сохранена в: $BACKUP_DIR"
-}
-
-list_awg_interfaces() {
-  # Получаем интерфейсы через AWG, не полагаясь на схему их имён.
-  awg show interfaces 2>/dev/null | tr ' ' '\n' | grep -v "^${OUT_IF}$" | sed '/^$/d' || true
-}
-
-detect_client_networks() {
-  local iface
-
-  while IFS= read -r iface; do
-    [[ -n "$iface" ]] || continue
-    ip -o -4 route show dev "$iface" scope link 2>/dev/null | \
-      awk -v iface="$iface" '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {print iface " " $1}'
-  done < <(list_awg_interfaces)
+detect_client_subnet() {
+  container_exec ip -o -4 route show dev "$SERVER_IF" scope link 2>/dev/null | \
+    awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {print $1; exit}'
 }
 
 choose_client_subnet() {
-  local detected=() iface subnet entry
-  while IFS= read -r entry; do
-    [[ -n "$entry" ]] && detected+=("$entry")
-  done < <(detect_client_networks)
-
-  if ((${#detected[@]} == 1)); then
-    read -r iface subnet <<< "${detected[0]}"
-    CLIENT_SUBNET="$subnet"
-    log "Клиентская подсеть определена автоматически: ${CLIENT_SUBNET} (${iface})"
+  CLIENT_SUBNET="$(detect_client_subnet)"
+  if [[ -n "$CLIENT_SUBNET" ]]; then
+    log "Клиентская подсеть определена автоматически: ${CLIENT_SUBNET} (${SERVER_IF})"
     return
   fi
 
-  if ((${#detected[@]} > 1)); then
-    warn "Найдено несколько возможных клиентских подсетей:"
-    for entry in "${detected[@]}"; do
-      read -r iface subnet <<< "$entry"
-      echo "  ${subnet} (${iface})"
-    done
-  else
-    warn "Не удалось автоматически определить клиентскую подсеть AWG на VPS-1."
-  fi
-
-  read -rp "Введите клиентскую подсеть AWG-сервера на VPS-1 [пример: 10.77.0.0/24]: " CLIENT_SUBNET
-  CLIENT_SUBNET="${CLIENT_SUBNET:-10.77.0.0/24}"
-}
-
-read_multiline_config() {
-  echo
-  echo "Вставьте полный клиентский конфиг AWG, созданный на VPS-2 для этого VPS-1."
-  echo "После конфига введите отдельной строкой: END"
-  echo
-  local tmp
-  tmp="$(mktemp)"
-  while IFS= read -r line; do
-    [[ "$line" == "END" ]] && break
-    printf '%s\n' "$line" >> "$tmp"
-  done
-
-  sed -i 's/\r$//' "$tmp"
-  sed -i -E 's/^[[:space:]]+//; s/[[:space:]]+$//' "$tmp"
-  # Пустые I1-I5 из экспорта Amnezia могут не приниматься некоторыми версиями AWG.
-  # Непустые сигнатуры сохраняются без изменений.
-  sed -i -E '/^I[1-5][[:space:]]*=[[:space:]]*$/d' "$tmp"
-  # Служебный туннель не должен менять системный DNS на VPS-1.
-  sed -i -E '/^DNS[[:space:]]*=/d' "$tmp"
-
-  if ! grep -q '^\[Interface\]' "$tmp" || ! grep -q '^\[Peer\]' "$tmp"; then
-    err "Конфиг должен содержать секции [Interface] и [Peer]."
-    rm -f "$tmp"
-    exit 1
-  fi
-  if ! grep -q '^PrivateKey[[:space:]]*=' "$tmp" || ! grep -q '^Endpoint[[:space:]]*=' "$tmp"; then
-    err "Конфиг должен содержать параметры PrivateKey и Endpoint."
-    rm -f "$tmp"
-    exit 1
-  fi
-  if [[ "$(grep -c '^\[Peer\]' "$tmp")" -ne 1 ]]; then
-    err "Конфиг должен содержать ровно одну секцию [Peer] для VPS-2."
-    rm -f "$tmp"
-    exit 1
-  fi
-
-  install -m 600 "$tmp" "$OUT_CONF"
-  rm -f "$tmp"
-}
-
-sanitize_conf() {
-  # Удаляем CRLF и лишние пробелы, которые могут мешать awg-quick.
-  sed -i 's/\r$//' "$OUT_CONF"
-  sed -i -E 's/^[[:space:]]+//; s/[[:space:]]+$//' "$OUT_CONF"
-  chmod 600 "$OUT_CONF"
-}
-
-ensure_allowed_ips() {
-  if grep -q '^AllowedIPs[[:space:]]*=' "$OUT_CONF"; then
-    sed -i -E 's#^AllowedIPs[[:space:]]*=.*#AllowedIPs = 0.0.0.0/0, ::/0#' "$OUT_CONF"
-  else
-    sed -i '/^\[Peer\]/a AllowedIPs = 0.0.0.0/0, ::/0' "$OUT_CONF"
-  fi
-}
-
-configure_out_conf() {
-  local tmp
-  tmp="$(mktemp)"
-
-  # Не даём awg-quick добавить маршрут по умолчанию в основную таблицу.
-  # Через туннель пойдёт только клиентская подсеть VPS-1.
-  awk -v table_name="$TABLE_NAME" -v out_if="$OUT_IF" -v client_subnet="$CLIENT_SUBNET" '
-    BEGIN { in_interface = 0; hooks_added = 0 }
-
-    /^\[Interface\]$/ { in_interface = 1; print; next }
-
-    /^\[Peer\]$/ {
-      if (in_interface && !hooks_added) {
-        print "Table = off"
-        print "PostUp = ip route replace default dev " out_if " table " table_name "; while ip rule del from " client_subnet " table " table_name " 2>/dev/null; do :; done; ip rule add from " client_subnet " table " table_name "; iptables -t nat -C POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE"
-        print "PostDown = while ip rule del from " client_subnet " table " table_name " 2>/dev/null; do :; done; ip route flush table " table_name " 2>/dev/null || true; iptables -t nat -D POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE 2>/dev/null || true"
-        hooks_added = 1
-      }
-      in_interface = 0
-      print
-      next
-    }
-
-    in_interface && /^Table[[:space:]]*=/ { next }
-    in_interface && /^Post(Up|Down)[[:space:]]*=.*awg_cascade/ { next }
-    /^# Added by awg-cascade$/ { next }
-    /^Post(Up|Down)[[:space:]]*=.*awg_cascade/ { next }
-    { print }
-  ' "$OUT_CONF" > "$tmp"
-
-  install -m 600 "$tmp" "$OUT_CONF"
-  rm -f "$tmp"
-}
-
-add_table() {
-  mkdir -p "$(dirname "$RT_TABLES")"
-  touch "$RT_TABLES"
-  if ! grep -Eq "^[[:space:]]*${TABLE_ID}[[:space:]]+${TABLE_NAME}$" "$RT_TABLES"; then
-    # Удаляем конфликтующие записи с таким именем или номером таблицы.
-    sed -i -E "/^[[:space:]]*${TABLE_ID}[[:space:]]+/d; /[[:space:]]${TABLE_NAME}$/d" "$RT_TABLES"
-    echo "${TABLE_ID} ${TABLE_NAME}" >> "$RT_TABLES"
-  fi
-}
-
-enable_forwarding() {
-  cat > "$SYSCTL_FILE" <<SYSCTL
-net.ipv4.ip_forward=1
-SYSCTL
-  sysctl --system >/dev/null
-}
-
-make_rollback() {
-  cat > "$ROLLBACK_FILE" <<EOFROLL
-#!/usr/bin/env bash
-set -e
-systemctl disable --now awg-quick@${OUT_IF}.service 2>/dev/null || true
-while ip rule del from ${CLIENT_SUBNET} table ${TABLE_NAME} 2>/dev/null; do :; done
-ip route flush table ${TABLE_NAME} 2>/dev/null || true
-iptables -t nat -D POSTROUTING -s ${CLIENT_SUBNET} -o ${OUT_IF} -j MASQUERADE 2>/dev/null || true
-if [[ -f ${BACKUP_DIR}/99-awg-cascade.conf ]]; then
-  cp -a ${BACKUP_DIR}/99-awg-cascade.conf ${SYSCTL_FILE}
-else
-  rm -f ${SYSCTL_FILE}
-fi
-sysctl --system >/dev/null || true
-if [[ -f ${BACKUP_DIR}/${OUT_IF}.conf ]]; then
-  cp -a ${BACKUP_DIR}/${OUT_IF}.conf ${OUT_CONF}
-else
-  rm -f ${OUT_CONF}
-fi
-if [[ -f ${BACKUP_DIR}/rt_tables ]]; then
-  cp -a ${BACKUP_DIR}/rt_tables ${RT_TABLES}
-else
-  sed -i -E '/^[[:space:]]*${TABLE_ID}[[:space:]]+${TABLE_NAME}$/d' ${RT_TABLES}
-fi
-echo "Откат настроек каскада AWG завершён."
-EOFROLL
-  chmod +x "$ROLLBACK_FILE"
-}
-
-configure_routes() {
-  ip route replace default dev "$OUT_IF" table "$TABLE_NAME"
-  while ip rule del from "$CLIENT_SUBNET" table "$TABLE_NAME" 2>/dev/null; do :; done
-  ip rule add from "$CLIENT_SUBNET" table "$TABLE_NAME"
-
-  # Выполняем NAT клиентской подсети в выходной AWG-туннель.
-  iptables -t nat -C POSTROUTING -s "$CLIENT_SUBNET" -o "$OUT_IF" -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -s "$CLIENT_SUBNET" -o "$OUT_IF" -j MASQUERADE
-
+  warn "Не удалось автоматически определить клиентскую подсеть ${SERVER_IF}."
+  read -rp "Введите клиентскую подсеть VPS-1 [пример: 10.8.1.0/24]: " CLIENT_SUBNET
 }
 
 valid_ipv4_subnet() {
@@ -302,79 +112,283 @@ valid_ipv4_subnet() {
   done
 }
 
-start_out_if() {
-  systemctl enable "awg-quick@${OUT_IF}.service" >/dev/null 2>&1 || true
-  if ! systemctl restart "awg-quick@${OUT_IF}.service"; then
-    err "Не удалось запустить ${OUT_IF}. Проверьте: journalctl -u awg-quick@${OUT_IF} -xe"
+ipv4_to_int() {
+  local ip="$1" a b c d
+  IFS=. read -r a b c d <<< "$ip"
+  printf '%u\n' "$(( (10#$a << 24) + (10#$b << 16) + (10#$c << 8) + 10#$d ))"
+}
+
+ip_belongs_to_subnet() {
+  local ip="$1" subnet="$2" prefix network_ip ip_num network_num mask
+  prefix="${subnet#*/}"
+  network_ip="${subnet%/*}"
+  ip_num="$(ipv4_to_int "$ip")"
+  network_num="$(ipv4_to_int "$network_ip")"
+  if ((10#$prefix == 0)); then
+    mask=0
+  else
+    mask=$(( (0xFFFFFFFF << (32 - 10#$prefix)) & 0xFFFFFFFF ))
+  fi
+  (( (ip_num & mask) == (network_num & mask) ))
+}
+
+check_subnet_conflict() {
+  local config="$1" out_address out_ip
+  out_address="$(sed -n -E 's/^Address[[:space:]]*=[[:space:]]*([^,[:space:]]+).*/\1/p' "$config" | head -n 1)"
+  out_ip="${out_address%/*}"
+
+  if [[ ! "$out_address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+    err "Не удалось прочитать IPv4-адрес из параметра Address: ${out_address:-пусто}"
     exit 1
   fi
-  sleep 2
-  if ! ip link show "$OUT_IF" >/dev/null 2>&1; then
-    err "Интерфейс ${OUT_IF} не запустился. Проверьте: journalctl -u awg-quick@${OUT_IF} -xe"
+
+  if ip_belongs_to_subnet "$out_ip" "$CLIENT_SUBNET"; then
+    err "Адрес туннеля VPS-2 (${out_address}) пересекается с подсетью клиентов VPS-1 (${CLIENT_SUBNET})."
+    err "Задайте на VPS-2 другую внутреннюю подсеть AWG, создайте новый профиль и повторите запуск."
     exit 1
   fi
 }
 
-check_exit_ip() {
-  log "Проверяем подключение к Интернету через ${OUT_IF}..."
-  if ping -I "$OUT_IF" -c 2 -W 3 1.1.1.1 >/dev/null 2>&1; then
-    log "Ping через ${OUT_IF}: успешно"
-  else
-    warn "Ping через ${OUT_IF} не прошёл. Некоторые VPS блокируют ICMP, поэтому это не всегда ошибка."
+read_client_config() {
+  local tmp="$1" line input_finished=0
+
+  echo
+  echo "Вставьте полный клиентский конфиг AWG, созданный на VPS-2 для VPS-1."
+  echo "После последней строки конфига введите отдельной строкой: END"
+  echo
+
+  while IFS= read -r line; do
+    if [[ "$line" == "END" ]]; then
+      input_finished=1
+      break
+    fi
+    printf '%s\n' "$line" >> "$tmp"
+  done
+
+  if ((input_finished == 0)); then
+    err "Ввод конфига не завершён строкой END."
+    exit 1
   fi
 
-  if cmd_exists curl; then
-    local ip_out
-    ip_out="$(curl --interface "$OUT_IF" -4 -s --max-time 8 https://ifconfig.me || true)"
-    if [[ -n "$ip_out" ]]; then
-      log "Выходной IPv4-адрес через ${OUT_IF}: ${ip_out}"
-    else
-      warn "Не удалось определить выходной IP через curl --interface ${OUT_IF}."
-    fi
+  sed -i 's/\r$//' "$tmp"
+  sed -i -E 's/^[[:space:]]+//; s/[[:space:]]+$//' "$tmp"
+  sed -i -E '/^I[1-5][[:space:]]*=[[:space:]]*$/d' "$tmp"
+  sed -i -E '/^DNS[[:space:]]*=/d' "$tmp"
+
+  if [[ "$(grep -c '^\[Interface\]' "$tmp")" -ne 1 ]] || \
+     [[ "$(grep -c '^\[Peer\]' "$tmp")" -ne 1 ]]; then
+    err "Конфиг должен содержать ровно по одной секции [Interface] и [Peer]."
+    exit 1
+  fi
+
+  if ! grep -q '^PrivateKey[[:space:]]*=[[:space:]]*[^[:space:]]' "$tmp" || \
+     ! grep -q '^Address[[:space:]]*=[[:space:]]*[^[:space:]]' "$tmp" || \
+     ! grep -q '^PublicKey[[:space:]]*=[[:space:]]*[^[:space:]]' "$tmp" || \
+     ! grep -q '^Endpoint[[:space:]]*=[[:space:]]*[^[:space:]]' "$tmp"; then
+    err "Конфиг должен содержать непустые Address, PrivateKey, PublicKey и Endpoint."
+    exit 1
+  fi
+
+  if ! grep -q '^S3[[:space:]]*=[[:space:]]*[^[:space:]]' "$tmp" || \
+     ! grep -q '^S4[[:space:]]*=[[:space:]]*[^[:space:]]' "$tmp"; then
+    err "В конфиге нет параметров S3 и S4, характерных для AmneziaWG 2.0."
+    err "Создайте на VPS-2 новый профиль AmneziaWG 2.0, а не AmneziaWG Legacy."
+    exit 1
+  fi
+}
+
+prepare_out_config() {
+  local source="$1" result="$2"
+
+  awk -v table_id="$TABLE_ID" -v out_if="$OUT_IF" -v client_subnet="$CLIENT_SUBNET" '
+    BEGIN { in_interface = 0; hooks_added = 0 }
+
+    /^\[Interface\]$/ { in_interface = 1; print; next }
+
+    /^\[Peer\]$/ {
+      if (in_interface && !hooks_added) {
+        print "Table = off"
+        print "PostUp = ip route replace default dev " out_if " table " table_id "; while ip rule del from " client_subnet " table " table_id " 2>/dev/null; do :; done; ip rule add from " client_subnet " table " table_id "; iptables -t nat -C POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE"
+        print "PostDown = while ip rule del from " client_subnet " table " table_id " 2>/dev/null; do :; done; ip route flush table " table_id " 2>/dev/null || true; iptables -t nat -D POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE 2>/dev/null || true"
+        hooks_added = 1
+      }
+      in_interface = 0
+      print
+      next
+    }
+
+    in_interface && /^Table[[:space:]]*=/ { next }
+    in_interface && /^Post(Up|Down)[[:space:]]*=/ { next }
+    /^AllowedIPs[[:space:]]*=/ { print "AllowedIPs = 0.0.0.0/0"; next }
+    { print }
+  ' "$source" > "$result"
+
+  if ! grep -q '^AllowedIPs[[:space:]]*=' "$result"; then
+    sed -i '/^\[Peer\]/a AllowedIPs = 0.0.0.0/0' "$result"
+  fi
+  chmod 600 "$result"
+}
+
+backup_container_files() {
+  mkdir -p "$BACKUP_DIR"
+  docker cp "${CONTAINER}:${START_SCRIPT}" "$BACKUP_DIR/start.sh"
+  if container_exec test -f "$OUT_CONF"; then
+    docker cp "${CONTAINER}:${OUT_CONF}" "$BACKUP_DIR/${OUT_IF}.conf"
+    touch "$BACKUP_DIR/had-out-conf"
+  fi
+  log "Резервная копия сохранена в: $BACKUP_DIR"
+}
+
+install_out_config() {
+  local config="$1"
+  container_exec awg-quick down "$OUT_CONF" >/dev/null 2>&1 || true
+  docker cp "$config" "${CONTAINER}:${OUT_CONF}"
+  container_exec chmod 600 "$OUT_CONF"
+}
+
+patch_container_start() {
+  local original patched
+  original="$(mktemp)"
+  patched="$(mktemp)"
+  docker cp "${CONTAINER}:${START_SCRIPT}" "$original"
+
+  awk -v conf="$OUT_CONF" '
+    BEGIN { managed = 0; inserted = 0 }
+    /^# BEGIN awg-cascade$/ { managed = 1; next }
+    /^# END awg-cascade$/ { managed = 0; next }
+    managed { next }
+    /^tail -f \/dev\/null$/ && !inserted {
+      print "# BEGIN awg-cascade"
+      print "awg-quick down " conf " 2>/dev/null || true"
+      print "if [ -f " conf " ]; then awg-quick up " conf "; fi"
+      print "# END awg-cascade"
+      inserted = 1
+    }
+    { print }
+    END {
+      if (!inserted) {
+        print "# BEGIN awg-cascade"
+        print "awg-quick down " conf " 2>/dev/null || true"
+        print "if [ -f " conf " ]; then awg-quick up " conf "; fi"
+        print "# END awg-cascade"
+      }
+    }
+  ' "$original" > "$patched"
+
+  docker cp "$patched" "${CONTAINER}:${START_SCRIPT}"
+  container_exec chmod +x "$START_SCRIPT"
+  rm -f "$original" "$patched"
+}
+
+make_rollback() {
+  cat > "$ROLLBACK_FILE" <<EOFROLL
+#!/usr/bin/env bash
+set -e
+CONTAINER='${CONTAINER}'
+OUT_CONF='${OUT_CONF}'
+START_SCRIPT='${START_SCRIPT}'
+BACKUP_DIR='${BACKUP_DIR}'
+
+if ! docker ps -a --format '{{.Names}}' | grep -qx "\$CONTAINER"; then
+  echo "Контейнер \$CONTAINER не найден."
+  exit 1
+fi
+
+docker start "\$CONTAINER" >/dev/null 2>&1 || true
+docker exec "\$CONTAINER" awg-quick down "\$OUT_CONF" >/dev/null 2>&1 || true
+docker cp "\$BACKUP_DIR/start.sh" "\$CONTAINER:\$START_SCRIPT"
+
+if [[ -f "\$BACKUP_DIR/had-out-conf" ]]; then
+  docker cp "\$BACKUP_DIR/${OUT_IF}.conf" "\$CONTAINER:\$OUT_CONF"
+else
+  docker exec "\$CONTAINER" rm -f "\$OUT_CONF"
+fi
+
+docker restart "\$CONTAINER" >/dev/null
+echo "Откат каскада AWG завершён. Контейнер \$CONTAINER перезапущен."
+EOFROLL
+  chmod +x "$ROLLBACK_FILE"
+}
+
+start_out_interface() {
+  container_exec awg-quick down "$OUT_CONF" >/dev/null 2>&1 || true
+  if ! container_exec awg-quick up "$OUT_CONF"; then
+    err "Не удалось запустить ${OUT_IF} внутри контейнера ${CONTAINER}."
+    return 1
+  fi
+  if ! container_exec ip link show "$OUT_IF" >/dev/null 2>&1; then
+    err "Интерфейс ${OUT_IF} не появился внутри контейнера."
+    return 1
+  fi
+}
+
+check_cascade() {
+  local client_ip route exit_ip
+  client_ip="$(container_exec ip -o -4 addr show dev "$SERVER_IF" | awk 'NR==1 {split($4, a, "/"); print a[1]}')"
+  route="$(container_exec ip route get 1.1.1.1 from "$client_ip" 2>/dev/null || true)"
+
+  if grep -q "dev ${OUT_IF}" <<< "$route"; then
+    log "Policy routing направляет клиентский трафик через ${OUT_IF}."
   else
-    warn "Команда curl не найдена, проверка выходного IP пропущена."
+    err "Проверка policy routing не прошла: ${route:-маршрут не найден}"
+    return 1
+  fi
+
+  if container_exec sh -c 'command -v curl >/dev/null 2>&1'; then
+    exit_ip="$(container_exec curl --interface "$SERVER_IF" -4 -s --max-time 10 https://ifconfig.me || true)"
+    if [[ -n "$exit_ip" ]]; then
+      log "Выходной IPv4-адрес каскада: ${exit_ip}"
+    else
+      warn "Маршрут настроен, но определить внешний IP через curl не удалось."
+    fi
+  fi
+}
+
+rollback_on_error() {
+  local status=$?
+  if ((status != 0)) && [[ "${SETUP_IN_PROGRESS:-0}" == "1" ]] && [[ -x "$ROLLBACK_FILE" ]]; then
+    warn "Настройка завершилась с ошибкой. Выполняем автоматический откат."
+    SETUP_IN_PROGRESS=0
+    bash "$ROLLBACK_FILE" || warn "Автоматический откат завершился с ошибкой: $ROLLBACK_FILE"
   fi
 }
 
 main() {
+  local raw_config prepared_config
+  SETUP_IN_PROGRESS=0
+  trap rollback_on_error EXIT
+
   need_root
-  require_cmds
-  check_awg_on_vps1
-  choose_conf_dir
+  require_host_cmds
+  check_awg_container
 
-  echo "=== Настройка каскада AWG: клиент -> VPS-1 -> VPS-2 -> Интернет ==="
   echo
-  log "Скрипт добавит выходной туннель через VPS-2 к существующему серверу AWG."
-
-  local interfaces
-  interfaces="$(list_awg_interfaces)"
-  echo
-  echo "Обнаруженные AWG/WG-интерфейсы на VPS-1:"
-  echo "${interfaces:-не найдены}"
-  echo
-
+  echo "=== Каскад AWG: клиент -> VPS-1 -> VPS-2 -> Интернет ==="
   choose_client_subnet
-
   if ! valid_ipv4_subnet "$CLIENT_SUBNET"; then
     err "Некорректная подсеть IPv4: $CLIENT_SUBNET"
     exit 1
   fi
 
-  backup
-  read_multiline_config
-  sanitize_conf
-  ensure_allowed_ips
-  configure_out_conf
-  add_table
-  enable_forwarding
-  make_rollback
-  start_out_if
-  configure_routes
-  check_exit_ip
+  raw_config="$(mktemp)"
+  prepared_config="$(mktemp)"
+  read_client_config "$raw_config"
+  check_subnet_conflict "$raw_config"
+  prepare_out_config "$raw_config" "$prepared_config"
 
+  backup_container_files
+  make_rollback
+  SETUP_IN_PROGRESS=1
+  install_out_config "$prepared_config"
+  patch_container_start
+  start_out_interface
+  check_cascade
+  SETUP_IN_PROGRESS=0
+
+  rm -f "$raw_config" "$prepared_config"
   echo
-  log "Каскад AWG настроен."
-  echo "Трафик подсети ${CLIENT_SUBNET} будет направлен через ${OUT_IF} -> VPS-2."
+  log "Каскад AWG настроен внутри контейнера ${CONTAINER}."
+  echo "Все клиенты подсети ${CLIENT_SUBNET} будут выходить через VPS-2."
   echo "Для отката выполните: bash ${ROLLBACK_FILE}"
 }
 
