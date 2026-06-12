@@ -71,12 +71,24 @@ VPS-1, принимает этот профиль и создаёт служеб
 
 ## Установка
 
-Подключитесь к VPS-1 и запустите:
+Подключитесь к VPS-1 по SSH, скопируйте команду целиком и нажмите Enter:
 
 ```bash
-chmod +x awg-cascade.sh
-sudo bash awg-cascade.sh
+sudo bash -c 'f=$(mktemp); trap "rm -f \"$f\"" EXIT; curl -fsSL https://raw.githubusercontent.com/ryderams/amneziawg-cascade/main/awg-cascade.sh -o "$f" && bash "$f"'
 ```
+
+Больше ничего скачивать или загружать вручную не нужно. Скрипт сам загрузится,
+запустится и удалит временный файл после завершения.
+
+Если команда сообщает, что `curl` не найден, используйте вариант с `wget`:
+
+```bash
+sudo bash -c 'f=$(mktemp); trap "rm -f \"$f\"" EXIT; wget -qO "$f" https://raw.githubusercontent.com/ryderams/amneziawg-cascade/main/awg-cascade.sh && bash "$f"'
+```
+
+> [!NOTE]
+> Команда запускает интерактивный скрипт через временный файл. Благодаря этому
+> пользователь сможет вставить клиентский AWG-конфиг прямо в терминал.
 
 Скрипт проверит:
 
