@@ -377,7 +377,7 @@ check_cascade() {
       log "Выходной IPv4-адрес каскада: ${exit_ip}"
     else
       err "Маршрут настроен, но HTTPS через каскад не работает."
-      err "Запустите awg-cascade-debug.sh на VPS-1 и awg-cascade-debug-vps2.sh на VPS-2."
+      err "Проверьте handshake и маршруты командами из раздела «Проверка» в README."
       return 1
     fi
   fi

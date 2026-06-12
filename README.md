@@ -221,23 +221,23 @@ sudo docker exec amnezia-awg2 ip route show table 200
 sudo docker ps --filter name=amnezia-awg2
 ```
 
-Если устройство подключается, но сайты не открываются, запустите на VPS-1 диагностику:
+Проверка туннеля и маршрутов на VPS-1:
 
 ```bash
-sudo bash -c 'f=$(mktemp); trap "rm -f \"$f\"" EXIT; curl -fsSL https://raw.githubusercontent.com/ryderams/amneziawg-cascade/main/awg-cascade-debug.sh -o "$f" && bash "$f"'
+sudo docker exec amnezia-awg2 awg show awg-out
+sudo docker exec amnezia-awg2 ip rule show
+sudo docker exec amnezia-awg2 ip route show table 200
+sudo docker exec amnezia-awg2 iptables -nvL FORWARD
+sudo docker exec amnezia-awg2 iptables -t nat -nvL POSTROUTING
 ```
 
-Диагностика не выводит приватные ключи. Она показывает handshake, объём трафика,
-MTU, policy routing, forwarding и счётчики `iptables` внутри контейнера.
-
-Если на VPS-1 пакеты уходят в `awg-out`, но ответы не возвращаются, выполните на VPS-2:
+Проверка peer и обратного маршрута на VPS-2:
 
 ```bash
-sudo bash -c 'f=$(mktemp); trap "rm -f \"$f\"" EXIT; curl -fsSL https://raw.githubusercontent.com/ryderams/amneziawg-cascade/main/awg-cascade-debug-vps2.sh -o "$f" && bash "$f"'
+sudo docker exec amnezia-awg2 awg show awg0
+sudo docker exec amnezia-awg2 ip route show
+sudo docker exec amnezia-awg2 iptables -t nat -nvL POSTROUTING
 ```
-
-Адрес `Address` из профиля VPS-2 можно передать аргументом для точечной проверки,
-например `bash awg-cascade-debug-vps2.sh 10.99.0.2` при ручном запуске файла.
 
 ## Откат
 
