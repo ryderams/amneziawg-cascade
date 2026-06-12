@@ -168,19 +168,23 @@ read_client_config() {
 
   echo
   echo "Вставьте полный клиентский конфиг AWG, созданный на VPS-2 для VPS-1."
-  echo "После последней строки конфига введите отдельной строкой: END"
+  echo "После вставки нажмите Enter ещё раз, чтобы оставить пустую строку."
   echo
 
   while IFS= read -r line; do
-    if [[ "$line" == "END" ]]; then
-      input_finished=1
-      break
+    if [[ -z "${line//[[:space:]]/}" ]]; then
+      if grep -q '^\[Peer\]' "$tmp" && \
+         grep -q '^PublicKey[[:space:]]*=[[:space:]]*[^[:space:]]' "$tmp" && \
+         grep -q '^Endpoint[[:space:]]*=[[:space:]]*[^[:space:]]' "$tmp"; then
+        input_finished=1
+        break
+      fi
     fi
     printf '%s\n' "$line" >> "$tmp"
   done
 
   if ((input_finished == 0)); then
-    err "Ввод конфига не завершён строкой END."
+    err "Ввод конфига не завершён пустой строкой."
     exit 1
   fi
 
