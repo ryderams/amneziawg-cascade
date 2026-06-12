@@ -207,9 +207,10 @@ prepare_out_config() {
 
     /^\[Peer\]$/ {
       if (in_interface && !hooks_added) {
+        print "MTU = 1280"
         print "Table = off"
-        print "PostUp = ip route replace default dev " out_if " table " table_id "; while ip rule del from " client_subnet " table " table_id " 2>/dev/null; do :; done; ip rule add from " client_subnet " table " table_id "; iptables -t nat -C POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE"
-        print "PostDown = while ip rule del from " client_subnet " table " table_id " 2>/dev/null; do :; done; ip route flush table " table_id " 2>/dev/null || true; iptables -t nat -D POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE 2>/dev/null || true"
+        print "PostUp = ip route replace default dev " out_if " table " table_id "; while ip rule del from " client_subnet " table " table_id " 2>/dev/null; do :; done; ip rule add from " client_subnet " table " table_id "; iptables -C FORWARD -i awg0 -o " out_if " -s " client_subnet " -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i awg0 -o " out_if " -s " client_subnet " -j ACCEPT; iptables -C FORWARD -i " out_if " -o awg0 -d " client_subnet " -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i " out_if " -o awg0 -d " client_subnet " -m state --state ESTABLISHED,RELATED -j ACCEPT; iptables -t nat -C POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE; iptables -t mangle -C FORWARD -o " out_if " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -o " out_if " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; iptables -t mangle -C FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+        print "PostDown = while ip rule del from " client_subnet " table " table_id " 2>/dev/null; do :; done; ip route flush table " table_id " 2>/dev/null || true; iptables -D FORWARD -i awg0 -o " out_if " -s " client_subnet " -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i " out_if " -o awg0 -d " client_subnet " -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -s " client_subnet " -o " out_if " -j MASQUERADE 2>/dev/null || true; iptables -t mangle -D FORWARD -o " out_if " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; iptables -t mangle -D FORWARD -o awg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true"
         hooks_added = 1
       }
       in_interface = 0
@@ -218,6 +219,7 @@ prepare_out_config() {
     }
 
     in_interface && /^Table[[:space:]]*=/ { next }
+    in_interface && /^MTU[[:space:]]*=/ { next }
     in_interface && /^Post(Up|Down)[[:space:]]*=/ { next }
     /^AllowedIPs[[:space:]]*=/ { print "AllowedIPs = 0.0.0.0/0"; next }
     { print }
@@ -323,9 +325,25 @@ start_out_interface() {
 }
 
 check_cascade() {
-  local client_ip route exit_ip
+  local client_ip route exit_ip mtu handshake
   client_ip="$(container_exec ip -o -4 addr show dev "$SERVER_IF" | awk 'NR==1 {split($4, a, "/"); print a[1]}')"
   route="$(container_exec ip route get 1.1.1.1 from "$client_ip" 2>/dev/null || true)"
+
+  mtu="$(container_exec ip -o link show dev "$OUT_IF" | awk '{for (i=1; i<=NF; i++) if ($i == "mtu") {print $(i+1); exit}}')"
+  if [[ "$mtu" != "1280" ]]; then
+    err "Интерфейс ${OUT_IF} имеет неожиданный MTU: ${mtu:-не определён}."
+    return 1
+  fi
+
+  if ! container_exec iptables -C FORWARD -i "$SERVER_IF" -o "$OUT_IF" -s "$CLIENT_SUBNET" -j ACCEPT 2>/dev/null; then
+    err "Не установлено правило FORWARD из ${SERVER_IF} в ${OUT_IF}."
+    return 1
+  fi
+
+  if ! container_exec iptables -t mangle -C FORWARD -o "$OUT_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+    err "Не установлено правило TCP MSS clamping для ${OUT_IF}."
+    return 1
+  fi
 
   if grep -q "dev ${OUT_IF}" <<< "$route"; then
     log "Policy routing направляет клиентский трафик через ${OUT_IF}."
@@ -335,13 +353,21 @@ check_cascade() {
   fi
 
   if container_exec sh -c 'command -v curl >/dev/null 2>&1'; then
-    exit_ip="$(container_exec curl --interface "$SERVER_IF" -4 -s --max-time 10 https://ifconfig.me || true)"
+    exit_ip="$(container_exec curl --interface "$client_ip" -4 -s --max-time 10 https://ifconfig.me || true)"
     if [[ -n "$exit_ip" ]]; then
       log "Выходной IPv4-адрес каскада: ${exit_ip}"
     else
       warn "Маршрут настроен, но определить внешний IP через curl не удалось."
     fi
   fi
+
+  handshake="$(container_exec awg show "$OUT_IF" latest-handshakes 2>/dev/null | awk 'NR==1 {print $2}')"
+  if [[ -z "$handshake" || "$handshake" == "0" ]]; then
+    err "Нет успешного handshake между VPS-1 и VPS-2."
+    err "Проверьте Endpoint, ключи, порт AWG и firewall на VPS-2."
+    return 1
+  fi
+  log "Handshake с VPS-2 подтверждён."
 }
 
 rollback_on_error() {
