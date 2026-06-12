@@ -227,6 +227,15 @@ sudo bash -c 'f=$(mktemp); trap "rm -f \"$f\"" EXIT; curl -fsSL https://raw.gith
 Диагностика не выводит приватные ключи. Она показывает handshake, объём трафика,
 MTU, policy routing, forwarding и счётчики `iptables` внутри контейнера.
 
+Если на VPS-1 пакеты уходят в `awg-out`, но ответы не возвращаются, выполните на VPS-2:
+
+```bash
+sudo bash -c 'f=$(mktemp); trap "rm -f \"$f\"" EXIT; curl -fsSL https://raw.githubusercontent.com/ryderams/amneziawg-cascade/main/awg-cascade-debug-vps2.sh -o "$f" && bash "$f"'
+```
+
+Адрес `Address` из профиля VPS-2 можно передать аргументом для точечной проверки,
+например `bash awg-cascade-debug-vps2.sh 10.99.0.2` при ручном запуске файла.
+
 ## Откат
 
 Для удаления каскада и восстановления сохранённых файлов выполните на VPS-1:

@@ -38,6 +38,7 @@ container_run awg show interfaces
 container_run awg show "$SERVER_IF" listen-port
 container_run awg show "$SERVER_IF" peers
 container_run awg show "$OUT_IF" endpoints
+container_run awg show "$OUT_IF" allowed-ips
 container_run awg show "$OUT_IF" latest-handshakes
 container_run awg show "$OUT_IF" transfer
 

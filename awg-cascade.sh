@@ -357,7 +357,9 @@ check_cascade() {
     if [[ -n "$exit_ip" ]]; then
       log "Выходной IPv4-адрес каскада: ${exit_ip}"
     else
-      warn "Маршрут настроен, но определить внешний IP через curl не удалось."
+      err "Маршрут настроен, но HTTPS через каскад не работает."
+      err "Запустите awg-cascade-debug.sh на VPS-1 и awg-cascade-debug-vps2.sh на VPS-2."
+      return 1
     fi
   fi
 
