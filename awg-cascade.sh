@@ -5,6 +5,7 @@ set -Eeuo pipefail
 # клиент -> awg0 на VPS-1 -> awg-out -> VPS-2 -> Интернет
 
 CONTAINER="amnezia-awg2"
+SCRIPT_VERSION="2026.06.12-2"
 SERVER_IF="awg0"
 OUT_IF="awg-out"
 TABLE_ID="200"
@@ -411,7 +412,7 @@ main() {
   check_awg_container
 
   echo
-  echo "=== Каскад AWG: клиент -> VPS-1 -> VPS-2 -> Интернет ==="
+  echo "=== Каскад AWG ${SCRIPT_VERSION}: клиент -> VPS-1 -> VPS-2 -> Интернет ==="
   choose_client_subnet
   if ! valid_ipv4_subnet "$CLIENT_SUBNET"; then
     err "Некорректная подсеть IPv4: $CLIENT_SUBNET"
